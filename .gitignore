@@ -1,0 +1,5 @@
+tls/certs/*
+data
+**/logs/*
+**/node_modules/*
+.DS_Store
