@@ -1,0 +1,127 @@
+################################################################################
+# This Dockerfile was generated from the template at distribution/src/docker/Dockerfile
+#
+# Beginning of multi stage Dockerfile
+################################################################################
+
+################################################################################
+# Build stage 0 `builder`:
+# Extract elasticsearch artifact
+# Install required plugins
+# Set gid=0 and make group perms==owner perms
+################################################################################
+
+FROM quay.io/centos/centos:stream8 AS builder
+
+# ARG ARTIFACTORY_API_KEY
+# During upgrade no need to change these values. Right values will be injected by Jenkins at build
+# ARG DIVE_VERSION=2023_03_v1
+# ARG DIVE_CONFIG_FOLDER=config
+# ARG ARTIFACTORY_BASE_URL=https://artifactory.build.ge.com
+# ARG ARTIFACTORY_REPO=KYPNN-SNAPSHOT
+# ARG ARTIFACTORY_PATH=dive/elasticsearch/external/
+# ARG ARTIFACTORY_URI=${ARTIFACTORY_BASE_URL}/${ARTIFACTORY_REPO}/${ARTIFACTORY_PATH}
+# ARG ARTIFACTORY_BINARY=elasticsearch-${ELK_VERSION}-linux-x86_64.tar.gz
+ARG ELK_VERSION=8.12.2
+ARG ELASTICSEARCH_BINARY=elasticsearch-${ELK_VERSION}-linux-x86_64.tar.gz
+
+ENV PATH /usr/share/elasticsearch/bin:$PATH
+
+# RUN yum install -y unzip which
+
+RUN for iter in {1..10}; do yum update --setopt=tsflags=nodocs -y \
+    && yum install --setopt=tsflags=nodocs -y procps-ng gzip shadow-utils tar \
+    && yum clean all && exit_code=0 && break || exit_code=$? \
+    && echo "yum error: retry $iter in 10s" && sleep 10; done;     (exit $exit_code)
+
+RUN groupadd -g 1000 elasticsearch \
+    && adduser -u 1000 -g 1000 -d /usr/share/elasticsearch elasticsearch
+
+WORKDIR /usr/share/elasticsearch
+
+ENV ELASTICSEARCH_PACKAGE ${ELASTICSEARCH_BINARY}
+ENV ELASTICSEARCH_HOME /usr/share/elasticsearch
+# ARG ES_CERTS_DIR=/etc/tls/certs
+
+# RUN cd /opt && curl -L -H "X-JFrog-Art-Api:${ARTIFACTORY_API_KEY}" -O ${ARTIFACTORY_URI}/${ELASTICSEARCH_PACKAGE} && cd -
+RUN cd /opt && curl --retry 8 -v -s -L -O https://artifacts.elastic.co/downloads/elasticsearch/${ELASTICSEARCH_PACKAGE} && cd -
+
+RUN cd ${ELASTICSEARCH_HOME} \
+    && tar zxf /opt/${ELASTICSEARCH_PACKAGE} --strip-components=1 \
+    && rm -rf /opt/${ELASTICSEARCH_PACKAGE}
+RUN grep ES_DISTRIBUTION_TYPE=tar /usr/share/elasticsearch/bin/elasticsearch-env \
+    && sed -i -e 's/ES_DISTRIBUTION_TYPE=tar/ES_DISTRIBUTION_TYPE=docker/' /usr/share/elasticsearch/bin/elasticsearch-env
+RUN mkdir -p data logs
+RUN chmod 0775 data logs
+
+# RUN mkdir -p config data logs
+# RUN chmod 0775 config data logs
+# COPY $DIVE_CONFIG_FOLDER/elasticsearch.yml $DIVE_CONFIG_FOLDER/log4j2.properties config/
+# RUN chmod 0660 config/elasticsearch.yml config/log4j2.properties
+
+################################################################################
+# Build stage 1 (the actual elasticsearch image):
+# Copy elasticsearch from stage 0
+# Add entrypoint
+################################################################################
+
+FROM quay.io/centos/centos:stream8
+
+# ARG DIVE_CONFIG_FOLDER=config
+ENV ELASTIC_CONTAINER true
+# ENV CURL_CA_BUNDLE /etc/ssl/certs/cacerts.pem
+
+# ADD ./cacerts.pem $CURL_CA_BUNDLE
+# COPY ./$DIVE_CONFIG_FOLDER/ /usr/share/elasticsearch/config/
+# ADD ./config/setup /usr/share/elasticsearch/setup
+# ADD ./config/sso /usr/share/elasticsearch/sso
+# ADD ./config/jvm.options /usr/share/elasticsearch/jvm.options
+
+# yum install -y nc unzip wget which openssl gettext && \
+
+RUN for iter in {1..10}; do yum update --setopt=tsflags=nodocs -y \
+    && yum install --setopt=tsflags=nodocs -y procps-ng nc shadow-utils zip unzip openssl gettext \
+    && yum clean all && exit_code=0 && break || exit_code=$? \
+    && echo "yum error: retry $iter in 10s" && sleep 10; done;     (exit $exit_code)
+
+RUN groupadd -g 1000 elasticsearch \
+    && adduser -u 1000 -g 1000 -G 0 -d /usr/share/elasticsearch elasticsearch \
+    && chmod 0775 /usr/share/elasticsearch \
+    && chgrp 0 /usr/share/elasticsearch
+
+WORKDIR /usr/share/elasticsearch
+COPY --from=builder --chown=1000:0 /usr/share/elasticsearch /usr/share/elasticsearch
+
+# print contents of ES config folder and es.yml to make confirm right config (DS vs EKS) bundled
+RUN ls -ltr /usr/share/elasticsearch/config/
+# RUN cat /usr/share/elasticsearch/config/elasticsearch.yml
+
+# Replace OpenJDK's built-in CA certificate keystore with the one from the OS
+# vendor. The latter is superior in several ways.
+# REF: https://github.com/elastic/elasticsearch-docker/issues/171
+RUN ln -sf /etc/pki/ca-trust/extracted/java/cacerts /usr/share/elasticsearch/jdk/lib/security/cacerts
+
+ENV PATH /usr/share/elasticsearch/bin:$PATH
+ENV JAVA_TRUSTSTORE_PWD $JAVA_TRUSTSTORE_PWD
+ENV SMTP_HOST_NAME $SMTP_HOST_NAME
+ENV SMTP_PORT_NUMBER $SMTP_PORT_NUMBER
+ENV SAML_ENTITY_ID $SAML_ENTITY_ID
+ENV EXTERNAL_HOSTNAME $EXTERNAL_HOSTNAME
+
+COPY --chown=1000:0 bin/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+
+# Openshift overrides USER and uses ones with randomly uid>1024 and gid=0
+# Allow ENTRYPOINT (and ES) to run even with a different user
+RUN chgrp 0 /usr/local/bin/docker-entrypoint.sh \
+    && chmod g=u /etc/passwd \
+    && chmod 0775 /usr/local/bin/docker-entrypoint.sh
+
+EXPOSE 9200 9300
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+# Dummy overridable parameter parsed by entrypoint
+CMD ["eswrapper"]
+
+################################################################################
+# End of multi-stage Dockerfile
+################################################################################
